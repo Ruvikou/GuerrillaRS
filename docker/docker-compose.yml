@@ -1,0 +1,241 @@
+# Guerrilla RS - Docker Compose
+# USO 1: Fundamentos Privacy-First
+# Servicios: PostgreSQL 16, MinIO, Redis (KeyDB), App SvelteKit
+
+version: '3.8'
+
+services:
+  # PostgreSQL 16 - Base de datos principal
+  postgres:
+    image: postgres:16-alpine
+    container_name: guerrillars-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-guerrilla}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_in_production}
+      POSTGRES_DB: ${POSTGRES_DB:-guerrillars}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"  # Solo localhost, no expuesto público
+    command: >
+      postgres
+      -c ssl=off
+      -c password_encryption=scram-sha-256
+      -c max_connections=100
+      -c shared_buffers=256MB
+      -c effective_cache_size=768MB
+      -c maintenance_work_mem=64MB
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=16MB
+      -c default_statistics_target=100
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c work_mem=1310kB
+      -c min_wal_size=1GB
+      -c max_wal_size=4GB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-guerrilla} -d ${POSTGRES_DB:-guerrillars}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - guerrillars-network
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+
+  # KeyDB - Redis multi-thread (drop-in replacement)
+  redis:
+    image: eqalpha/keydb:latest
+    container_name: guerrillars-redis
+    restart: unless-stopped
+    environment:
+      - KEYDB_PASSWORD=${REDIS_PASSWORD:-changeme_in_production}
+    command: >
+      keydb-server
+      --requirepass ${REDIS_PASSWORD:-changeme_in_production}
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --server-threads 4
+    volumes:
+      - redis_data:/data
+    ports:
+      - "127.0.0.1:6379:6379"  # Solo localhost
+    healthcheck:
+      test: ["CMD", "keydb-cli", "-a", "${REDIS_PASSWORD:-changeme_in_production}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - guerrillars-network
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # MinIO - Almacenamiento de objetos (S3-compatible)
+  minio:
+    image: minio/minio:latest
+    container_name: guerrillars-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-changeme_in_production}
+      MINIO_BROWSER: "on"
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    ports:
+      - "127.0.0.1:9000:9000"  # API S3
+      - "127.0.0.1:9001:9001"  # Console Web UI
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - guerrillars-network
+    security_opt:
+      - no-new-privileges:true
+
+  # Crear buckets iniciales en MinIO
+  minio-init:
+    image: minio/mc:latest
+    container_name: guerrillars-minio-init
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 10;
+      /usr/bin/mc config host add local http://minio:9000 ${MINIO_ACCESS_KEY:-minioadmin} ${MINIO_SECRET_KEY:-changeme_in_production};
+      /usr/bin/mc mb -p local/guerrillars-media || true;
+      /usr/bin/mc mb -p local/guerrillars-avatars || true;
+      /usr/bin/mc mb -p local/guerrillars-backups || true;
+      /usr/bin/mc anonymous set download local/guerrillars-media || true;
+      /usr/bin/mc anonymous set download local/guerrillars-avatars || true;
+      exit 0;
+      "
+    networks:
+      - guerrillars-network
+
+  # Aplicación SvelteKit
+  app:
+    build:
+      context: ../apps/web
+      dockerfile: Dockerfile
+    container_name: guerrillars-app
+    restart: unless-stopped
+    environment:
+      # Database
+      DATABASE_URL: postgresql://${POSTGRES_USER:-guerrilla}:${POSTGRES_PASSWORD:-changeme_in_production}@postgres:5432/${POSTGRES_DB:-guerrillars}?schema=public
+      
+      # Redis
+      REDIS_URL: redis://:${REDIS_PASSWORD:-changeme_in_production}@redis:6379
+      
+      # MinIO
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-changeme_in_production}
+      MINIO_BUCKET_MEDIA: guerrillars-media
+      MINIO_BUCKET_AVATARS: guerrillars-avatars
+      MINIO_USE_SSL: "false"
+      
+      # JWT (generar en producción con: openssl ecparam -genkey -name prime256v1 -noout -out private.pem)
+      JWT_PRIVATE_KEY: ${JWT_PRIVATE_KEY}
+      JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY}
+      
+      # Session
+      SESSION_SALT: ${SESSION_SALT:-generate_random_salt_in_production}
+      
+      # Ephemeral encryption key
+      EPHEMERAL_KEY: ${EPHEMERAL_KEY:-generate_random_key_in_production}
+      
+      # Face API models path
+      FACE_API_MODELS_PATH: /app/models
+      
+      # Node environment
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: "3000"
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - faceapi_models:/app/models:ro
+    networks:
+      - guerrillars-network
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+
+  # Nginx Reverse Proxy (opcional, para producción)
+  nginx:
+    image: nginx:alpine
+    container_name: guerrillars-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - certbot_data:/etc/letsencrypt
+    depends_on:
+      - app
+    networks:
+      - guerrillars-network
+    profiles:
+      - production  # Solo en producción
+
+  # Certbot para SSL (opcional)
+  certbot:
+    image: certbot/certbot:latest
+    container_name: guerrillars-certbot
+    volumes:
+      - certbot_data:/etc/letsencrypt
+      - ./nginx/www:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+    networks:
+      - guerrillars-network
+    profiles:
+      - production
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  minio_data:
+    driver: local
+  faceapi_models:
+    driver: local
+  certbot_data:
+    driver: local
+
+networks:
+  guerrillars-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

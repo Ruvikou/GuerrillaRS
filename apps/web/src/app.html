@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="es">
+	<head>
+		<meta charset="utf-8" />
+		<link rel="icon" href="%sveltekit.assets%/favicon.png" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="theme-color" content="#0a0f1c" />
+		<meta name="color-scheme" content="dark light" />
+		
+		<!-- Metadatos SEO -->
+		<meta name="description" content="Guerrilla RS - Red social privacy-first, sin algoritmos, sin rastreadores. Un bosque digital donde la tecnología crece orgánicamente." />
+		<meta name="keywords" content="red social, privacidad, solarpunk, open source, zero tracking" />
+		<meta name="author" content="Guerrilla RS" />
+		
+		<!-- Open Graph -->
+		<meta property="og:title" content="Guerrilla RS" />
+		<meta property="og:description" content="Red social privacy-first, sin algoritmos, sin rastreadores." />
+		<meta property="og:type" content="website" />
+		<meta property="og:url" content="https://guerrillars.es" />
+		<meta property="og:image" content="%sveltekit.assets%/og-image.png" />
+		
+		<!-- Twitter Card -->
+		<meta name="twitter:card" content="summary_large_image" />
+		<meta name="twitter:title" content="Guerrilla RS" />
+		<meta name="twitter:description" content="Red social privacy-first, sin algoritmos, sin rastreadores." />
+		<meta name="twitter:image" content="%sveltekit.assets%/og-image.png" />
+		
+		<!-- Preconnect a recursos críticos -->
+		<link rel="preconnect" href="https://fonts.googleapis.com" />
+		<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+		
+		<!-- Fuentes (self-hosted recomendado en producción) -->
+		<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Source+Sans+3:wght@400;500;600&display=swap" rel="stylesheet" />
+		
+		<!-- Estilos críticos inline -->
+		<style>
+			/* Critical CSS para First Paint */
+			:root {
+				--bg-primary: #0a0f1c;
+				--text-primary: #ecfdf5;
+			}
+			
+			* {
+				margin: 0;
+				padding: 0;
+				box-sizing: border-box;
+			}
+			
+			html {
+				font-family: 'Inter', system-ui, -apple-system, sans-serif;
+				background-color: var(--bg-primary);
+				color: var(--text-primary);
+			}
+			
+			body {
+				min-height: 100vh;
+				line-height: 1.5;
+				-webkit-font-smoothing: antialiased;
+				-moz-osx-font-smoothing: grayscale;
+			}
+			
+			/* Reduced motion */
+			@media (prefers-reduced-motion: reduce) {
+				* {
+					animation-duration: 0.01ms !important;
+					animation-iteration-count: 1 !important;
+					transition-duration: 0.01ms !important;
+				}
+			}
+		</style>
+		
+		%sveltekit.head%
+	</head>
+	<body data-sveltekit-preload-data="hover">
+		<div style="display: contents">%sveltekit.body%</div>
+	</body>
+</html>
