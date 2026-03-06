@@ -1,5 +1,5 @@
 // Guerrilla RS - Schema Prisma
-// USO 1 + USO 2: Fundamentos Privacy-First + Sistema Social Core
+// USO 1: Fundamentos Privacy-First
 // REGLAS: Sin isAdmin, sin identityHash, con accessLevel enum y docHash
 
 generator client {
@@ -34,14 +34,6 @@ enum VerificationMethod {
   EUDI_WALLET
 }
 
-// Tipos de contenido para posts
-enum PostType {
-  TEXT
-  PHOTO
-  VIDEO
-  POLL
-}
-
 model User {
   id                    String   @id @default(uuid())
   username              String   @unique
@@ -64,10 +56,8 @@ model User {
   verificationNotes     String?
   verificationRequestedAt DateTime?
   
-  // Limitaciones para UNVERIFIED
-  dailyTimeLimitSeconds Int      @default(1800) // 30 minutos por defecto
-  dailyTimeUsedSeconds  Int      @default(0)    // Tiempo usado hoy
-  lastActivityReset     DateTime @default(now()) // Último reset del contador
+  // Limitaciones
+  dailyTimeLimitSeconds Int      @default(1800) // 30 minutos por defecto para UNVERIFIED
   
   // Perfil
   avatarUrl             String?
@@ -75,24 +65,13 @@ model User {
   location              String?
   website               String?
   
-  // Preferencias de feed
-  feedFilters           Json?    // { postTypes: [], tagsInclude: [], tagsExclude: [] }
-  
   // Timestamps
   createdAt             DateTime @default(now())
   updatedAt             DateTime @updatedAt
   deletedAt             DateTime? // Soft delete
   
-  // Relaciones - Posts
+  // Relaciones
   posts                 Post[]
-  
-  // Relaciones - Social
-  following             Follow[] @relation("Following")
-  followers             Follow[] @relation("Followers")
-  likes                 Like[]
-  comments              Comment[]
-  
-  // Relaciones - Logs
   auditLogs             AuditLog[]
   
   // Índices críticos para seguridad
@@ -100,7 +79,6 @@ model User {
   @@index([docHash])
   @@index([createdAt])
   @@index([deletedAt])
-  @@index([lastActivityReset])
 }
 
 model WebAuthnCredential {
@@ -137,82 +115,23 @@ model Post {
   authorId    String
   author      User     @relation(fields: [authorId], references: [id])
   
-  // Contenido
   content     String   @db.Text
-  mediaUrls   String[] // URLs de MinIO (originales)
-  thumbnailUrls String[] // URLs de thumbnails WebP
-  postType    PostType @default(TEXT)
+  mediaUrls   String[] // URLs de MinIO
   
-  // Visibilidad
   visibility  Visibility @default(PUBLIC)
   
   // Engagement
   likesCount    Int @default(0)
   commentsCount Int @default(0)
   
-  // Tags para búsqueda
-  tags          String[]
-  
   // Timestamps
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
-  editedAt    DateTime? // Cuándo fue editado
   deletedAt   DateTime? // Soft delete
-  
-  // Relaciones
-  likes       Like[]
-  comments    Comment[]
   
   @@index([authorId, createdAt])
   @@index([visibility, createdAt])
   @@index([deletedAt])
-  @@index([tags])
-}
-
-model Follow {
-  id          String   @id @default(uuid())
-  followerId  String
-  followingId String
-  createdAt   DateTime @default(now())
-  
-  follower    User     @relation("Following", fields: [followerId], references: [id], onDelete: Cascade)
-  following   User     @relation("Followers", fields: [followingId], references: [id], onDelete: Cascade)
-  
-  @@unique([followerId, followingId])
-  @@index([followingId])
-  @@index([followerId])
-}
-
-model Like {
-  id        String   @id @default(uuid())
-  userId    String
-  postId    String
-  createdAt DateTime @default(now())
-  
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  post      Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
-  
-  @@unique([userId, postId])
-  @@index([postId])
-  @@index([userId])
-}
-
-model Comment {
-  id        String   @id @default(uuid())
-  authorId  String
-  postId    String
-  content   String   @db.Text
-  parentId  String?  // Para anidamiento (max 3 niveles)
-  createdAt DateTime @default(now())
-  
-  author    User     @relation(fields: [authorId], references: [id], onDelete: Cascade)
-  post      Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
-  parent    Comment? @relation("Replies", fields: [parentId], references: [id])
-  replies   Comment[] @relation("Replies")
-  
-  @@index([postId, createdAt])
-  @@index([authorId])
-  @@index([parentId])
 }
 
 model AuditLog {

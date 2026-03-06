@@ -1,186 +1,126 @@
-// Guerrilla RS - Sistema de Permisos Server-Side
-// USO 1: Fundamentos Privacy-First
-// REGLA: NUNCA confiar en cliente para permisos. Verificar accessLevel en BD en CADA request.
-
-import { error, redirect } from '@sveltejs/kit';
-import {
-	AccessLevel,
-	ACCESS_LEVEL_ORDER,
-	PERMISSIONS,
-	type Permission,
-	type AppLocals
-} from '$lib/types/auth';
+import { error } from '@sveltejs/kit';
+import { prisma } from './prisma';
+import type { AccessLevel } from '$lib/types/auth';
+import { ACCESS_LEVEL_HIERARCHY, PERMISSIONS } from '$lib/types/auth';
 
 /**
  * Verifica si un nivel de acceso tiene un permiso específico
- * Type-safe: el permiso debe ser un valor válido de Permission
+ * NUNCA confiar en accessLevel del cliente - siempre verificar en BD
  */
 export function hasPermission(
 	accessLevel: AccessLevel,
-	permission: Permission
+	permission: readonly AccessLevel[]
 ): boolean {
-	return PERMISSIONS[accessLevel][permission] ?? false;
+	return permission.includes(accessLevel);
 }
 
 /**
- * Verifica si un nivel de acceso tiene TODOS los permisos especificados
- */
-export function hasAllPermissions(
-	accessLevel: AccessLevel,
-	permissions: Permission[]
-): boolean {
-	return permissions.every((perm) => hasPermission(accessLevel, perm));
-}
-
-/**
- * Verifica si un nivel de acceso tiene ALGUNO de los permisos especificados
- */
-export function hasAnyPermission(
-	accessLevel: AccessLevel,
-	permissions: Permission[]
-): boolean {
-	return permissions.some((perm) => hasPermission(accessLevel, perm));
-}
-
-/**
- * Compara dos niveles de acceso
- * Retorna true si userLevel >= requiredLevel
+ * Verifica si accessLevelA es mayor o igual que accessLevelB
  */
 export function hasMinimumAccess(
-	userLevel: AccessLevel,
-	requiredLevel: AccessLevel
+	accessLevel: AccessLevel,
+	minimumLevel: AccessLevel
 ): boolean {
-	return ACCESS_LEVEL_ORDER[userLevel] >= ACCESS_LEVEL_ORDER[requiredLevel];
+	return ACCESS_LEVEL_HIERARCHY[accessLevel] >= ACCESS_LEVEL_HIERARCHY[minimumLevel];
 }
 
 /**
- * Guard de ruta: requiere nivel mínimo de acceso
- * Lanza error 403 si no cumple
+ * Obtiene el valor numérico de un accessLevel
  */
-export function requireAccess(
-	locals: AppLocals,
-	minLevel: AccessLevel,
-	options: { redirectTo?: string; throwError?: boolean } = {}
-): void {
-	const { redirectTo, throwError = true } = options;
+export function getVerifiedAccessLevel(accessLevel: AccessLevel): number {
+	return ACCESS_LEVEL_HIERARCHY[accessLevel];
+}
 
-	if (!hasMinimumAccess(locals.accessLevel, minLevel)) {
-		if (redirectTo) {
-			throw redirect(303, redirectTo);
+/**
+ * Obtiene usuario desde la base de datos por ID
+ * Usado para anti-tampering: verificar JWT contra BD
+ */
+export async function getUserById(userId: string) {
+	return prisma.user.findUnique({
+		where: { id: userId },
+		select: {
+			id: true,
+			username: true,
+			accessLevel: true,
+			verifiedAt: true,
+			suspendedAt: true
 		}
-		if (throwError) {
-			throw error(403, {
-				message: 'Acceso denegado',
-				details: `Se requiere nivel ${minLevel} o superior`
-			});
-		}
+	});
+}
+
+/**
+ * Verifica si el usuario está autenticado
+ * Lanza 401 si no lo está
+ */
+export function requireAuth(locals: App.Locals): NonNullable<App.Locals['user']> {
+	if (!locals.user) {
+		throw error(401, 'Autenticación requerida');
+	}
+	return locals.user;
+}
+
+/**
+ * Verifica si el usuario tiene nivel mínimo requerido
+ * Lanza 403 si no lo tiene
+ */
+export function requireAccessLevel(
+	accessLevel: AccessLevel,
+	minimumLevel: AccessLevel
+): void {
+	if (!hasMinimumAccess(accessLevel, minimumLevel)) {
+		throw error(403, 'No tienes permisos para realizar esta acción');
 	}
 }
 
 /**
- * Guard de ruta: requiere permiso específico
- * Lanza error 403 si no cumple
+ * Verifica si el usuario está verificado (VERIFIED_16+)
+ * Lanza 403 si no lo está
  */
-export function requirePermission(
-	locals: AppLocals,
-	permission: Permission,
-	options: { redirectTo?: string; throwError?: boolean } = {}
-): void {
-	const { redirectTo, throwError = true } = options;
-
-	if (!hasPermission(locals.accessLevel, permission)) {
-		if (redirectTo) {
-			throw redirect(303, redirectTo);
-		}
-		if (throwError) {
-			throw error(403, {
-				message: 'Acceso denegado',
-				details: `No tienes permiso para ${permission}`
-			});
-		}
+export function requireVerified(accessLevel: AccessLevel): void {
+	if (!hasMinimumAccess(accessLevel, 'VERIFIED_16')) {
+		throw error(403, 'Verificación de edad requerida');
 	}
 }
 
 /**
- * Guard de ruta: requiere autenticación (cualquier nivel excepto PUBLIC)
+ * Verifica si el usuario es moderador (MODERATOR+)
+ * Lanza 403 si no lo es
  */
-export function requireAuth(
-	locals: AppLocals,
-	options: { redirectTo?: string } = {}
-): void {
-	const { redirectTo = '/login' } = options;
-
-	if (locals.accessLevel === AccessLevel.PUBLIC || !locals.user) {
-		throw redirect(303, redirectTo);
+export function requireModerator(accessLevel: AccessLevel): void {
+	if (!hasMinimumAccess(accessLevel, 'MODERATOR')) {
+		throw error(403, 'Permisos de moderador requeridos');
 	}
 }
 
 /**
- * Guard de ruta: requiere verificación de edad (VERIFIED_16 o superior)
+ * Verifica si el usuario es admin (ADMIN only)
+ * Lanza 403 si no lo es
  */
-export function requireVerified(
-	locals: AppLocals,
-	options: { redirectTo?: string } = {}
-): void {
-	const { redirectTo = '/verify' } = options;
-
-	if (!hasMinimumAccess(locals.accessLevel, AccessLevel.VERIFIED_16)) {
-		throw redirect(303, redirectTo);
+export function requireAdmin(accessLevel: AccessLevel): void {
+	if (accessLevel !== 'ADMIN') {
+		throw error(403, 'Permisos de administrador requeridos');
 	}
 }
 
 /**
- * Guard de ruta: requiere ser moderador
+ * Verifica ownership de un recurso
+ * Lanza 403 si el usuario no es el propietario ni admin
  */
-export function requireModerator(locals: AppLocals): void {
-	requireAccess(locals, AccessLevel.MODERATOR);
-}
-
-/**
- * Guard de ruta: requiere ser admin
- */
-export function requireAdmin(locals: AppLocals): void {
-	requireAccess(locals, AccessLevel.ADMIN);
-}
-
-/**
- * Obtiene todos los permisos de un nivel de acceso
- */
-export function getPermissions(accessLevel: AccessLevel): Record<Permission, boolean> {
-	return { ...PERMISSIONS[accessLevel] };
-}
-
-/**
- * Lista de permisos activos para un nivel (para debugging/UI)
- */
-export function getActivePermissions(accessLevel: AccessLevel): Permission[] {
-	return Object.entries(PERMISSIONS[accessLevel])
-		.filter(([, value]) => value)
-		.map(([key]) => key as Permission);
-}
-
-/**
- * Verifica si el usuario puede realizar una acción sobre un recurso
- * Considera: nivel de acceso, propiedad del recurso, y permisos específicos
- */
-export function canModifyResource(
-	locals: AppLocals,
+export function requireOwnership(
 	resourceOwnerId: string,
-	requiredPermission?: Permission
-): boolean {
-	// Admin puede todo
-	if (locals.accessLevel === AccessLevel.ADMIN) return true;
-
-	// Moderador puede modificar recursos de otros con permiso específico
-	if (locals.accessLevel === AccessLevel.MODERATOR) {
-		if (requiredPermission) {
-			return hasPermission(locals.accessLevel, requiredPermission);
-		}
-		return true;
+	userId: string,
+	accessLevel: AccessLevel
+): void {
+	if (resourceOwnerId !== userId && accessLevel !== 'ADMIN') {
+		throw error(403, 'No eres el propietario de este recurso');
 	}
+}
 
-	// Usuario verificado solo puede modificar sus propios recursos
-	if (locals.user?.id === resourceOwnerId) return true;
-
-	return false;
+/**
+ * Middleware combinado: requiere auth y verificación
+ */
+export function requireAuthAndVerified(locals: App.Locals): NonNullable<App.Locals['user']> {
+	const user = requireAuth(locals);
+	requireVerified(user.accessLevel);
+	return user;
 }

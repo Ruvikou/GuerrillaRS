@@ -1,278 +1,210 @@
-// Guerrilla RS - API Endpoint de Verificación de Edad
-// USO 1: Fundamentos Privacy-First
-// REGLAS:
-// - Rate limiting: 3 intentos/hora por IP
-// - Borrado inmediato en finally{} garantizado
-// - Solo almacenar docHash, nunca imágenes
-
 import { json, error } from '@sveltejs/kit';
-import type { RequestHandler } from './$types';
-import { prisma } from '$lib/server/db';
-import {
-	normalizeDocumentImage,
-	generateDocHash,
-	isDocHashUnique,
-	extractBirthDate,
-	calculateAge,
-	compareFaces,
-	performOCR,
-	secureDelete,
-	checkVerificationRateLimit,
-	logVerificationAttempt,
-	verifyUser
-} from '$lib/server/verification';
-import { AccessLevel } from '$lib/types/auth';
+import { createWorker } from 'tesseract.js';
+import * as faceapi from 'face-api.js';
+import { canvas } from 'canvas';
+import { prisma } from '$lib/server/prisma';
 import { requireAuth } from '$lib/server/permissions';
-import { createHash } from 'crypto';
+import {
+	calculateDocHash,
+	encryptEphemeral,
+	decryptEphemeral,
+	secureDelete,
+	checkVerificationLimit,
+	recordVerificationAttempt,
+	extractBirthDate,
+	validateAge
+} from '$lib/server/verification';
+import { FACE_API_MODELS_PATH, FACE_MATCH_THRESHOLD } from '$env/static/private';
+import type { RequestHandler } from './$types';
 
-// Clave efímera para desencriptación (en producción, debería rotarse)
-const EPHEMERAL_KEY = process.env.EPHEMERAL_KEY || '';
+// Cargar modelos de face-api
+let modelsLoaded = false;
+async function loadModels() {
+	if (modelsLoaded) return;
+	const modelPath = FACE_API_MODELS_PATH || './models';
+	await faceapi.nets.ssdMobilenetv1.loadFromDisk(modelPath);
+	await faceapi.nets.faceLandmark68Net.loadFromDisk(modelPath);
+	await faceapi.nets.faceRecognitionNet.loadFromDisk(modelPath);
+	modelsLoaded = true;
+}
 
-/**
- * POST /api/verify
- * Endpoint principal de verificación de edad
- */
-export const POST: RequestHandler = async (event) => {
-	const { request, locals, getClientAddress } = event;
-
-	// 1. REQUIERE AUTENTICACIÓN
-	requireAuth(locals);
-
-	// 2. Verificar que el usuario no esté ya verificado
-	if (locals.accessLevel !== AccessLevel.UNVERIFIED) {
-		throw error(400, {
-			message: 'Usuario ya verificado o no requiere verificación'
-		});
+// POST /api/verify - Verificar edad con documento y selfie
+export const POST: RequestHandler = async ({ request, locals, getClientAddress }) => {
+	const user = requireAuth(locals);
+	
+	// Verificar límite de intentos
+	const ipHash = require('crypto').createHash('sha256').update(getClientAddress()).digest('hex');
+	const { allowed, remaining } = checkVerificationLimit(ipHash);
+	
+	if (!allowed) {
+		throw error(429, 'Demasiados intentos. Espera 1 hora.');
 	}
 
-	// 3. RATE LIMITING: 3 intentos por hora por IP
-	const clientIp = getClientAddress();
-	const ipHash = createHash('sha256')
-		.update(clientIp + process.env.SESSION_SALT)
-		.digest('hex')
-		.slice(0, 32);
+	// Procesar multipart form data
+	const formData = await request.formData();
+	const documentImage = formData.get('document') as File;
+	const selfieImage = formData.get('selfie') as File;
 
-	const rateLimit = await checkVerificationRateLimit(ipHash);
-	if (!rateLimit.allowed) {
-		throw error(429, {
-			message: 'Demasiados intentos',
-			details: `Intenta de nuevo en ${Math.ceil((rateLimit.resetAt.getTime() - Date.now()) / 60000)} minutos`,
-			resetAt: rateLimit.resetAt
-		});
+	if (!documentImage || !selfieImage) {
+		throw error(400, 'Se requiere documento y selfie');
 	}
 
-	// 4. Parsear request body
-	let body: { idImageEncrypted?: string; selfieEncrypted?: string };
+	// Validar tipos
+	if (!documentImage.type.startsWith('image/') || !selfieImage.type.startsWith('image/')) {
+		throw error(400, 'Archivos deben ser imágenes');
+	}
+
+	let docBuffer: Buffer | null = null;
+	let selfieBuffer: Buffer | null = null;
+	let encryptedDoc: Buffer | null = null;
+	let encryptedSelfie: Buffer | null = null;
+	let docIv: string = '';
+	let selfieIv: string = '';
+
 	try {
-		body = await request.json();
-	} catch {
-		throw error(400, { message: 'Body inválido' });
-	}
+		// Leer buffers
+		docBuffer = Buffer.from(await documentImage.arrayBuffer());
+		selfieBuffer = Buffer.from(await selfieImage.arrayBuffer());
 
-	const { idImageEncrypted, selfieEncrypted } = body;
+		// Encriptar temporalmente
+		const docEncrypted = encryptEphemeral(docBuffer);
+		const selfieEncrypted = encryptEphemeral(selfieBuffer);
+		encryptedDoc = docEncrypted.encrypted;
+		encryptedSelfie = selfieEncrypted.encrypted;
+		docIv = docEncrypted.iv;
+		selfieIv = selfieEncrypted.iv;
 
-	if (!idImageEncrypted || !selfieEncrypted) {
-		throw error(400, { message: 'Se requieren imagen de documento y selfie' });
-	}
+		// Limpiar buffers originales
+		secureDelete(docBuffer);
+		secureDelete(selfieBuffer);
+		docBuffer = null;
+		selfieBuffer = null;
 
-	// Variables para las imágenes desencriptadas
-	let idImage: Buffer | null = null;
-	let selfie: Buffer | null = null;
-	let normalizedImage: Buffer | null = null;
+		// Desencriptar para procesamiento
+		docBuffer = decryptEphemeral(encryptedDoc, docIv);
+		selfieBuffer = decryptEphemeral(encryptedSelfie, selfieIv);
 
-	try {
-		// 5. Desencriptar imágenes (clave efímera)
-		idImage = decryptEphemeral(idImageEncrypted);
-		selfie = decryptEphemeral(selfieEncrypted);
+		// 1. OCR del documento
+		const worker = await createWorker('spa');
+		const {
+			data: { text: ocrText }
+		} = await worker.recognize(docBuffer);
+		await worker.terminate();
 
-		// Validar que sean imágenes válidas
-		if (!isValidImage(idImage) || !isValidImage(selfie)) {
-			throw error(400, { message: 'Formato de imagen inválido' });
-		}
-
-		// 6. Normalizar imagen del documento
-		normalizedImage = await normalizeDocumentImage(idImage);
-
-		// 7. Generar docHash (SHA-256 de imagen normalizada)
-		const docHash = generateDocHash(normalizedImage);
-
-		// 8. Verificar duplicado (anti-spam)
-		const isUnique = await isDocHashUnique(docHash);
-		if (!isUnique) {
-			await logVerificationAttempt(ipHash, locals.user?.id || null, false);
-			throw error(409, {
-				message: 'Este documento ya ha sido utilizado',
-				details: 'Contacta soporte si crees que es un error'
-			});
-		}
-
-		// 9. OCR para extraer fecha de nacimiento
-		const ocrResult = await performOCR(idImage);
-		const birthDate = extractBirthDate(ocrResult.text);
-
+		// Extraer fecha de nacimiento
+		const birthDate = extractBirthDate(ocrText);
 		if (!birthDate) {
-			await logVerificationAttempt(ipHash, locals.user?.id || null, false);
-			throw error(422, {
-				message: 'No se pudo leer la fecha de nacimiento',
-				details: 'Asegúrate de que la imagen sea clara y legible'
-			});
+			recordVerificationAttempt(ipHash);
+			throw error(400, 'No se pudo leer la fecha de nacimiento. Intenta con mejor iluminación.');
 		}
 
-		// 10. Calcular edad
-		const age = calculateAge(birthDate);
-
-		// 11. Comparación facial (documento vs selfie)
-		const faceComparison = await compareFaces(idImage, selfie);
-
-		// 12. CRITERIOS DE VERIFICACIÓN:
-		// - Edad >= 16 años
-		// - Coincidencia facial (distance < 0.6)
-		// - OCR confianza > 50%
-		const verified = age >= 16 && faceComparison.match && ocrResult.confidence > 50;
-
-		if (verified) {
-			// 13. Actualizar usuario a VERIFIED_16
-			await verifyUser(locals.user!.id, docHash, 'DOCUMENT_OCR');
-
-			// Log de éxito
-			await logVerificationAttempt(ipHash, locals.user?.id || null, true);
-
-			return json({
-				success: true,
-				message: 'Verificación completada exitosamente',
-				data: {
-					accessLevel: AccessLevel.VERIFIED_16,
-					verifiedAt: new Date().toISOString()
-				}
-			});
-		} else {
-			// Log de fallo
-			await logVerificationAttempt(ipHash, locals.user?.id || null, false);
-
-			const reasons: string[] = [];
-			if (age < 16) reasons.push('Edad menor a 16 años');
-			if (!faceComparison.match) reasons.push('La foto no coincide con el documento');
-			if (ocrResult.confidence <= 50) reasons.push('Calidad de imagen insuficiente');
-
-			throw error(422, {
-				message: 'Verificación fallida',
-				details: reasons.join('. '),
-				reasons
-			});
-		}
-	} catch (err) {
-		// Re-lanzar errores de SvelteKit
-		if (err && typeof err === 'object' && 'status' in err) {
-			throw err;
+		// Validar edad
+		const { valid: ageValid, age } = validateAge(birthDate);
+		if (!ageValid) {
+			recordVerificationAttempt(ipHash);
+			throw error(403, `Debes tener al menos 16 años. Edad detectada: ${age}`);
 		}
 
-		console.error('Verification error:', err);
-		throw error(500, {
-			message: 'Error interno durante la verificación',
-			details: process.env.NODE_ENV === 'development' ? String(err) : undefined
+		// 2. Comparación facial
+		await loadModels();
+
+		// Detectar rostros
+		const docImg = await canvas.loadImage(docBuffer);
+		const selfieImg = await canvas.loadImage(selfieBuffer);
+
+		const docDetection = await faceapi
+			.detectSingleFace(docImg as any)
+			.withFaceLandmarks()
+			.withFaceDescriptor();
+
+		const selfieDetection = await faceapi
+			.detectSingleFace(selfieImg as any)
+			.withFaceLandmarks()
+			.withFaceDescriptor();
+
+		if (!docDetection || !selfieDetection) {
+			recordVerificationAttempt(ipHash);
+			throw error(400, 'No se detectó rostro en una o ambas imágenes');
+		}
+
+		// Calcular distancia euclidiana
+		const distance = faceapi.euclideanDistance(
+			docDetection.descriptor,
+			selfieDetection.descriptor
+		);
+
+		const threshold = parseFloat(FACE_MATCH_THRESHOLD || '0.6');
+		if (distance > threshold) {
+			recordVerificationAttempt(ipHash);
+			throw error(400, 'El rostro no coincide con el documento. Intenta de nuevo.');
+		}
+
+		// 3. Calcular docHash
+		const docHash = await calculateDocHash(docBuffer);
+
+		// Verificar que no esté duplicado
+		const existingHash = await prisma.user.findFirst({
+			where: { docHash }
 		});
+
+		if (existingHash && existingHash.id !== user.userId) {
+			recordVerificationAttempt(ipHash);
+			throw error(409, 'Este documento ya fue utilizado para verificar otra cuenta');
+		}
+
+		// 4. Actualizar usuario
+		await prisma.user.update({
+			where: { id: user.userId },
+			data: {
+				accessLevel: 'VERIFIED_16',
+				verifiedAt: new Date(),
+				docHash
+			}
+		});
+
+		// Registrar intento exitoso
+		recordVerificationAttempt(ipHash);
+
+		return json({
+			success: true,
+			message: 'Verificación completada',
+			age,
+			remainingAttempts: remaining - 1
+		});
+	} catch (e: any) {
+		// Limpiar buffers en caso de error
+		if (docBuffer) secureDelete(docBuffer);
+		if (selfieBuffer) secureDelete(selfieBuffer);
+		if (encryptedDoc) secureDelete(encryptedDoc);
+		if (encryptedSelfie) secureDelete(encryptedSelfie);
+
+		throw e;
 	} finally {
-		// 14. BORRADO INMEDIATO GARANTIZADO (REGLA CRÍTICA)
-		// Esto se ejecuta SIEMPRE, incluso si hay errores
-		secureDelete(idImage);
-		secureDelete(selfie);
-		secureDelete(normalizedImage);
+		// Asegurar borrado de buffers encriptados
+		if (encryptedDoc) secureDelete(encryptedDoc);
+		if (encryptedSelfie) secureDelete(encryptedSelfie);
 	}
 };
 
-/**
- * GET /api/verify/status
- * Obtiene el estado de verificación del usuario actual
- */
-export const GET: RequestHandler = async (event) => {
-	const { locals } = event;
+// GET /api/verify/status - Estado de verificación
+export const GET: RequestHandler = async ({ locals }) => {
+	const user = requireAuth(locals);
 
-	requireAuth(locals);
-
-	if (!locals.user) {
-		throw error(401, { message: 'No autenticado' });
-	}
-
-	const user = await prisma.user.findUnique({
-		where: { id: locals.user.id },
+	const dbUser = await prisma.user.findUnique({
+		where: { id: user.userId },
 		select: {
 			accessLevel: true,
-			verifiedAt: true,
-			verificationMethod: true,
-			verificationRequestedAt: true
+			verifiedAt: true
 		}
 	});
 
-	if (!user) {
-		throw error(404, { message: 'Usuario no encontrado' });
+	if (!dbUser) {
+		throw error(404, 'Usuario no encontrado');
 	}
-
-	// Obtener intentos restantes
-	const clientIp = event.getClientAddress();
-	const ipHash = createHash('sha256')
-		.update(clientIp + process.env.SESSION_SALT)
-		.digest('hex')
-		.slice(0, 32);
-
-	const rateLimit = await checkVerificationRateLimit(ipHash);
 
 	return json({
-		accessLevel: user.accessLevel,
-		isVerified: user.accessLevel === AccessLevel.VERIFIED_16,
-		verifiedAt: user.verifiedAt?.toISOString() || null,
-		verificationMethod: user.verificationMethod,
-		verificationRequestedAt: user.verificationRequestedAt?.toISOString() || null,
-		rateLimit: {
-			remaining: rateLimit.remaining,
-			resetAt: rateLimit.resetAt.toISOString()
-		}
+		verified: dbUser.accessLevel === 'VERIFIED_16' || dbUser.accessLevel === 'MODERATOR' || dbUser.accessLevel === 'ADMIN',
+		accessLevel: dbUser.accessLevel,
+		verifiedAt: dbUser.verifiedAt
 	});
 };
-
-/**
- * Desencripta datos usando la clave efímera
- * En producción, esto debería usar un sistema de encriptación más robusto
- */
-function decryptEphemeral(encryptedData: string): Buffer {
-	try {
-		// Implementación simplificada - en producción usar libsodium o similar
-		// Asumimos que los datos vienen en base64
-		const encryptedBuffer = Buffer.from(encryptedData, 'base64');
-
-		// XOR simple con clave (NO usar en producción real)
-		// En producción: usar AES-256-GCM con clave efímera por sesión
-		const key = Buffer.from(EPHEMERAL_KEY, 'hex');
-		const decrypted = Buffer.alloc(encryptedBuffer.length);
-
-		for (let i = 0; i < encryptedBuffer.length; i++) {
-			decrypted[i] = encryptedBuffer[i]! ^ key[i % key.length]!;
-		}
-
-		return decrypted;
-	} catch (err) {
-		console.error('Decryption error:', err);
-		throw error(400, { message: 'Error al desencriptar datos' });
-	}
-}
-
-/**
- * Valida que un buffer sea una imagen válida
- */
-function isValidImage(buffer: Buffer): boolean {
-	// Verificar magic bytes de formatos comunes
-	const magicBytes = {
-		png: [0x89, 0x50, 0x4e, 0x47],
-		jpeg: [0xff, 0xd8, 0xff],
-		jpg: [0xff, 0xd8, 0xff],
-		webp: [0x52, 0x49, 0x46, 0x46]
-	};
-
-	for (const [, bytes] of Object.entries(magicBytes)) {
-		if (buffer.length >= bytes.length) {
-			const match = bytes.every((byte, i) => buffer[i] === byte);
-			if (match) return true;
-		}
-	}
-
-	return false;
-}
