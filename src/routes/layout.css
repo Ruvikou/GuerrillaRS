@@ -1,0 +1,21 @@
+@import 'tailwindcss';
+@plugin '@tailwindcss/forms';
+@plugin '@tailwindcss/typography';
+
+:root {
+		--bg-primary: #0a0f1c;
+		--bg-elevated: #1a2234;
+		--moss: #059669;
+		--moss-light: #34d399;
+		--text-primary: #ecfdf5;
+		--text-secondary: #9ca3af;
+		--text-muted: #6b7280;
+		--border: #1f2937;
+		--error: #ef4444;
+		--radius-lg: 0.75rem 1.25rem 1rem 1.5rem;
+		--space-2: 0.5rem;
+		--space-3: 0.75rem;
+		--space-4: 1rem;
+		--space-6: 1.5rem;
+		--space-8: 2rem;
+}
